@@ -41,6 +41,11 @@ except ImportError:
     HAS_PLOTLY = False
 
 # --- Shared infrastructure (ultra_shared, optional) ---
+import sys as _sys
+_ultra_parent = str(Path(__file__).resolve().parent.parent)
+if _ultra_parent not in _sys.path:
+    _sys.path.insert(0, _ultra_parent)
+
 try:
     from ultra_shared.logging import setup_logging as _setup_logging
     from ultra_shared.config import load_config as _load_config
@@ -48,6 +53,12 @@ try:
 except ImportError:
     HAS_ULTRA_SHARED = False
 
+try:
+    from ultra_shared.schema import build_manifest, new_doc, add_tool_section, write_docs_jsonl
+    from ultra_shared.schema import write_manifest as _write_manifest
+    HAS_SCHEMA = True
+except ImportError:
+    HAS_SCHEMA = False
 
 NRC_VAD_PATH = Path(__file__).resolve().parent / "data" / "NRC-VAD-Lexicon-v2.1.txt"
 PLUTCHIK_EMOTIONS = ["anger", "anticipation", "disgust", "fear", "joy", "sadness", "surprise", "trust"]
@@ -1060,15 +1071,49 @@ def run(df, output_dir=None, run_absa=False, tier="full", run_embeddings=True,
     report_path.write_text(html, encoding="utf-8")
     print(f"Saved: {report_path}")
 
-    manifest = {
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "n_docs": len(doc_result.get("documents", [])),
-        "elapsed_sec": round(time.time() - _run_start, 2),
-        "models_used": tier,
-    }
-    manifest_file = output / "manifest.json"
-    manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    print(f"Manifest: {manifest_file}")
+    # ── Schema JSONL + manifest ────────────────────────────────────────────
+    if HAS_SCHEMA:
+        std_docs = []
+        for doc in doc_result.get("documents", []):
+            std_doc = new_doc(
+                doc.get("doc_id", ""),
+                doc.get("text_preview", ""),
+            )
+            sentiment_data = {
+                "polarity": doc.get("ensemble_polarity", 0),
+                "label": doc.get("ensemble_label", "neutral"),
+                "confidence": (
+                    doc.get("transformer", {}).get("results", {}).get("lightweight", {}).get("confidence", 0)
+                    or doc.get("transformer", {}).get("results", {}).get("sentiment", {}).get("confidence", 0)
+                ),
+                "transformer_polarity": doc.get("transformer", {}).get("transformer_polarity", 0),
+                "lexicon_raw": doc.get("lexicon_raw", {}),
+                "lexicon_calibrated": doc.get("lexicon_calibrated", 0),
+                "nrc_emotions": doc.get("nrc_emotions", {}),
+                "roberta_emotions": doc.get("roberta_emotions", {}),
+            }
+            add_tool_section(std_doc, "sentiment", sentiment_data)
+            std_docs.append(std_doc)
+
+        write_docs_jsonl(std_docs, output)
+        elapsed = time.time() - _run_start
+        m = build_manifest(
+            "sentiscape_ultra", len(doc_result.get("documents", [])), elapsed,
+            parameters={"profile": tier, "run_absa": run_absa, "run_embeddings": run_embeddings},
+        )
+        _write_manifest(m, output)
+        print(f"Schema JSONL: {output / 'ultra_output.jsonl'}")
+        print(f"Schema manifest: {output / 'manifest.json'}")
+    else:
+        manifest = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "n_docs": len(doc_result.get("documents", [])),
+            "elapsed_sec": round(time.time() - _run_start, 2),
+            "models_used": tier,
+        }
+        manifest_file = output / "manifest.json"
+        manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        print(f"Manifest: {manifest_file}")
 
     return doc_result
 
