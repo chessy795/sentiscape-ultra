@@ -1,0 +1,11 @@
+transformers>=4.30
+torch
+numpy
+pandas
+nltk
+afinn
+nrclex
+senticnet
+pyabsa
+sentence-transformers
+scikit-learn

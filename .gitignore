@@ -1,0 +1,11 @@
+output/
+output_*/
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+*.egg-info/
+dist/
+build/
+cache/
+data/
