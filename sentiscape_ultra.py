@@ -41,14 +41,14 @@ except ImportError:
     HAS_PLOTLY = False
 
 # --- Shared infrastructure (ultra_shared, optional) ---
-import sys as _sys
 _ultra_parent = str(Path(__file__).resolve().parent.parent)
-if _ultra_parent not in _sys.path:
-    _sys.path.insert(0, _ultra_parent)
+if _ultra_parent not in sys.path:
+    sys.path.insert(0, _ultra_parent)
 
 try:
     from ultra_shared.logging import setup_logging as _setup_logging
     from ultra_shared.config import load_config as _load_config
+    from ultra_shared.data import load_documents as _load_documents
     HAS_ULTRA_SHARED = True
 except ImportError:
     HAS_ULTRA_SHARED = False
@@ -703,49 +703,10 @@ def generate_sentiment_timeline(df, date_col=None, text_col="clean_text",
     return out_json
 
 
-def load_documents(csv_path=None, text_column=None):
-    if csv_path and Path(csv_path).exists():
-        df = pd.read_csv(csv_path)
-        print(f"Loaded {len(df)} rows from {csv_path}")
-        if not text_column:
-            for c in ["text", "clean_text", "usertext", "content", "body", "postings"]:
-                if c in df.columns: text_column = c; break
-        if not text_column: text_column = df.columns[0]
-        if "doc_id" not in df.columns:
-            id_col = next((c for c in ["id", "doc_id", "ID"] if c in df.columns), None)
-            if id_col: df = df.rename(columns={id_col: "doc_id"})
-            else: df["doc_id"] = [f"doc_{i}" for i in range(len(df))]
-        if text_column != "clean_text": df = df.rename(columns={text_column: "clean_text"})
-        return df.fillna("")
-    else:
-        print("Using demo texts")
-        return pd.DataFrame({
-            "doc_id": [f"doc_{i}" for i in range(12)],
-            "clean_text": [
-                "I feel so lonely and isolated in this world. The darkness never seems to lift.",
-                "The hotel staff were incredibly helpful and friendly! Best vacation ever!",
-                "This is the worst experience I have ever had. Terrible service, horrible food.",
-                "I love this city, the food is amazing and the culture is vibrant and exciting.",
-                "Quarantine made everything feel hopeless and empty. I miss my family so much.",
-                "The vaccine gives me hope for a brighter future. Science will save us!",
-                "I hate waiting in long lines at the airport. Such a waste of precious time.",
-                "Meeting friends again fills me with pure joy! Life is beautiful once more.",
-                "The pandemic has been devastating for mental health. So much suffering everywhere.",
-                "Beautiful scenery and wonderful local cuisine made this trip unforgettable.",
-                "I am scared and anxious about what comes next. The uncertainty is crushing.",
-                "Everything is perfect, I could not be happier. Today was absolutely wonderful!",
-            ],
-            "meta_group": ["negative", "positive", "negative", "positive", "negative", "positive",
-                           "negative", "positive", "negative", "positive", "negative", "positive"],
-        })
+# ─── Sub-functions for run() ─────────────────────────────────────────────────
 
 
-def run(df, output_dir=None, run_absa=False, tier="full", run_embeddings=True,
-        max_docs=500, quiet=False, group_col_override=None):
-    output = Path(output_dir or "output")
-    output.mkdir(exist_ok=True)
-    _run_start = time.time()
-
+def _print_banner(tier, run_absa, run_embeddings):
     model_names = {"full": "RoBERTa (sentiment + emotion + GoEmotions)", "lightweight": "DistilBERT"}
     print("\n" + "=" * 70)
     print("SENTIMENT ANALYSIS ULTRA v3")
@@ -758,8 +719,8 @@ def run(df, output_dir=None, run_absa=False, tier="full", run_embeddings=True,
     print("Embeddings: SBERT semantic clusters" if run_embeddings else "Embeddings: disabled")
     print()
 
-    ensemble = SentimentEnsemble(tier=tier)
 
+def _run_document_analysis(ensemble, df, max_docs, quiet, group_col=None, run_absa=False, run_embeddings=True):
     print("--- Deep-Dive ---")
     test = "I feel so hopeless and alone, but people keep telling me it will get better."
     r = ensemble.analyze_text(test, doc_id="demo", calibrate=False)
@@ -782,9 +743,10 @@ def run(df, output_dir=None, run_absa=False, tier="full", run_embeddings=True,
         print(f"  RoBERTa emotion: {top} ({r['roberta_emotions'][top]:.1%})")
 
     print("\n--- Document Analysis ---")
-    group_col = group_col_override or next((c for c in df.columns if c.startswith("meta_")), None)
+    text_col = "text" if "text" in df.columns else "clean_text"
     doc_result = ensemble.analyze_documents(
         df,
+        text_col=text_col,
         group_col=group_col,
         max_docs=min(len(df), max_docs),
         run_absa=run_absa,
@@ -836,7 +798,6 @@ def run(df, output_dir=None, run_absa=False, tier="full", run_embeddings=True,
         docs_w = sum(1 for ar in doc_result["absa_results"] if ar.get("aspects"))
         print(f"  Total: {total} aspects in {docs_w} docs")
 
-    # S5: Emoji integration — use raw 'body' column if available (emoji stripped from body_norm)
     has_raw_body = "body" in df.columns
     if has_raw_body:
         doc_result["_raw_body"] = df["body"].fillna("").astype(str).tolist()
@@ -862,66 +823,71 @@ def run(df, output_dir=None, run_absa=False, tier="full", run_embeddings=True,
         print(f"  Mean emoji polarity: {emoji_stats['emoji_sentiment_mean']:+.4f}")
     doc_result["emoji_stats"] = emoji_stats
 
-    # Fix 2: Group comparison statistics (Mann-Whitney U + Cohen's d)
-    if group_col and group_col in df.columns:
-        print("\n--- Group Comparison Statistics ---")
-        groups_pols = {}
-        for doc in doc_result["documents"]:
-            g = doc.get("group", "unknown")
-            groups_pols.setdefault(g, []).append(doc["ensemble_polarity"])
-        group_keys = sorted(groups_pols.keys())
-        if len(group_keys) == 2:
-            g1, g2 = group_keys[0], group_keys[1]
-            pols_g1 = np.array(groups_pols[g1])
-            pols_g2 = np.array(groups_pols[g2])
-            try:
-                from scipy.stats import mannwhitneyu
-                stat, p_val = mannwhitneyu(pols_g1, pols_g2, alternative="two-sided")
-            except ImportError:
-                def _rank_data(x):
-                    sorted_idx = np.argsort(x)
-                    ranks = np.empty_like(sorted_idx, dtype=float)
-                    ranks[sorted_idx] = np.arange(1, len(x) + 1, dtype=float)
-                    return ranks
-                r1 = _rank_data(pols_g1)
-                r2 = _rank_data(pols_g2)
-                n1, n2 = len(pols_g1), len(pols_g2)
-                u1 = n1 * n2 + n1 * (n1 + 1) / 2 - np.sum(r1)
-                u2 = n1 * n2 + n2 * (n2 + 1) / 2 - np.sum(r2)
-                stat = min(u1, u2)
-                mu_u = n1 * n2 / 2
-                sigma_u = np.sqrt(n1 * n2 * (n1 + n2 + 1) / 12)
-                z = (stat - mu_u) / sigma_u if sigma_u > 0 else 0
-                from scipy.stats import norm as _norm
-                p_val = 2 * (1 - _norm.cdf(abs(z))) if sigma_u > 0 else 1.0
-            pooled_std = np.sqrt((np.var(pols_g1, ddof=1) + np.var(pols_g2, ddof=1)) / 2)
-            cohens_d = (np.mean(pols_g1) - np.mean(pols_g2)) / pooled_std if pooled_std > 0 else 0
-            print(f"  Group '{g1}': n={len(pols_g1)}, mean={np.mean(pols_g1):+.4f}, std={np.std(pols_g1, ddof=1):.4f}")
-            print(f"  Group '{g2}': n={len(pols_g2)}, mean={np.mean(pols_g2):+.4f}, std={np.std(pols_g2, ddof=1):.4f}")
-            print(f"  Mann-Whitney U = {stat:.1f}, p = {p_val:.4f}")
-            print(f"  Cohen's d = {cohens_d:+.4f} ({'large' if abs(cohens_d) > 0.8 else 'medium' if abs(cohens_d) > 0.5 else 'small'})")
-            group_comparison = {
-                "g1": g1, "g2": g2,
-                "g1_n": int(len(pols_g1)), "g2_n": int(len(pols_g2)),
-                "g1_mean": round(float(np.mean(pols_g1)), 4), "g2_mean": round(float(np.mean(pols_g2)), 4),
-                "g1_std": round(float(np.std(pols_g1, ddof=1)), 4), "g2_std": round(float(np.std(pols_g2, ddof=1)), 4),
-                "mannwhitney_u": round(float(stat), 4), "p_value": round(float(p_val), 6),
-                "cohens_d": round(float(cohens_d), 4),
-                "effect_size": "large" if abs(cohens_d) > 0.8 else "medium" if abs(cohens_d) > 0.5 else "small",
-                "significant": p_val < 0.05,
-            }
-            doc_result["group_comparison"] = group_comparison
-            try:
-                gc_df = pd.DataFrame([group_comparison])
-                gc_df.to_csv(output / "group_comparison.csv", index=False)
-                print(f"  Saved: {output / 'group_comparison.csv'}")
-            except Exception as e:
-                print(f"  [WARN] Could not save group_comparison.csv: {e}")
-        else:
-            print(f"  {len(group_keys)} groups found — Mann-Whitney requires exactly 2 for pairwise comparison")
-            doc_result["group_comparison"] = {"groups": group_keys, "note": "more than 2 groups, pairwise comparison skipped"}
+    return doc_result
 
-    # S11: Sentiment explanation for top 5 most polar docs
+
+def _compute_group_comparison(group_col, doc_result, output):
+    if not group_col or not doc_result.get("documents"):
+        return None
+    print("\n--- Group Comparison Statistics ---")
+    groups_pols = {}
+    for doc in doc_result["documents"]:
+        g = doc.get("group", "unknown")
+        groups_pols.setdefault(g, []).append(doc["ensemble_polarity"])
+    group_keys = sorted(groups_pols.keys())
+    if len(group_keys) == 2:
+        g1, g2 = group_keys[0], group_keys[1]
+        pols_g1 = np.array(groups_pols[g1])
+        pols_g2 = np.array(groups_pols[g2])
+        try:
+            from scipy.stats import mannwhitneyu
+            stat, p_val = mannwhitneyu(pols_g1, pols_g2, alternative="two-sided")
+        except ImportError:
+            def _rank_data(x):
+                sorted_idx = np.argsort(x)
+                ranks = np.empty_like(sorted_idx, dtype=float)
+                ranks[sorted_idx] = np.arange(1, len(x) + 1, dtype=float)
+                return ranks
+            r1 = _rank_data(pols_g1)
+            r2 = _rank_data(pols_g2)
+            n1, n2 = len(pols_g1), len(pols_g2)
+            u1 = n1 * n2 + n1 * (n1 + 1) / 2 - np.sum(r1)
+            u2 = n1 * n2 + n2 * (n2 + 1) / 2 - np.sum(r2)
+            stat = min(u1, u2)
+            mu_u = n1 * n2 / 2
+            sigma_u = np.sqrt(n1 * n2 * (n1 + n2 + 1) / 12)
+            z = (stat - mu_u) / sigma_u if sigma_u > 0 else 0
+            from scipy.stats import norm as _norm
+            p_val = 2 * (1 - _norm.cdf(abs(z))) if sigma_u > 0 else 1.0
+        pooled_std = np.sqrt((np.var(pols_g1, ddof=1) + np.var(pols_g2, ddof=1)) / 2)
+        cohens_d = (np.mean(pols_g1) - np.mean(pols_g2)) / pooled_std if pooled_std > 0 else 0
+        print(f"  Group '{g1}': n={len(pols_g1)}, mean={np.mean(pols_g1):+.4f}, std={np.std(pols_g1, ddof=1):.4f}")
+        print(f"  Group '{g2}': n={len(pols_g2)}, mean={np.mean(pols_g2):+.4f}, std={np.std(pols_g2, ddof=1):.4f}")
+        print(f"  Mann-Whitney U = {stat:.1f}, p = {p_val:.4f}")
+        print(f"  Cohen's d = {cohens_d:+.4f} ({'large' if abs(cohens_d) > 0.8 else 'medium' if abs(cohens_d) > 0.5 else 'small'})")
+        group_comparison = {
+            "g1": g1, "g2": g2,
+            "g1_n": int(len(pols_g1)), "g2_n": int(len(pols_g2)),
+            "g1_mean": round(float(np.mean(pols_g1)), 4), "g2_mean": round(float(np.mean(pols_g2)), 4),
+            "g1_std": round(float(np.std(pols_g1, ddof=1)), 4), "g2_std": round(float(np.std(pols_g2, ddof=1)), 4),
+            "mannwhitney_u": round(float(stat), 4), "p_value": round(float(p_val), 6),
+            "cohens_d": round(float(cohens_d), 4),
+            "effect_size": "large" if abs(cohens_d) > 0.8 else "medium" if abs(cohens_d) > 0.5 else "small",
+            "significant": p_val < 0.05,
+        }
+        try:
+            gc_df = pd.DataFrame([group_comparison])
+            gc_df.to_csv(output / "group_comparison.csv", index=False)
+            print(f"  Saved: {output / 'group_comparison.csv'}")
+        except Exception as e:
+            print(f"  [WARN] Could not save group_comparison.csv: {e}")
+        return group_comparison
+    else:
+        print(f"  {len(group_keys)} groups found — Mann-Whitney requires exactly 2 for pairwise comparison")
+        return {"groups": group_keys, "note": "more than 2 groups, pairwise comparison skipped"}
+
+
+def _generate_explanations(doc_result):
     print("\n--- Sentiment Explanations (top 5 most polar) ---")
     sorted_docs = sorted(doc_result["documents"], key=lambda d: abs(d["ensemble_polarity"]), reverse=True)
     explanations = []
@@ -934,9 +900,10 @@ def run(df, output_dir=None, run_absa=False, tier="full", run_embeddings=True,
         explanations.append({"doc_id": doc["doc_id"], "explanation": exp})
         label = doc["ensemble_label"].upper()[:3]
         print(f"  [{label}] {doc['ensemble_polarity']:+.4f}: {exp[:100]}...")
-    doc_result["explanations"] = explanations
+    return explanations
 
-    # S2: Sentiment shift detection for long docs (>2 sentences)
+
+def _detect_sentiment_shifts(doc_result):
     print("\n--- Sentiment Shift Detection ---")
     shift_docs = [d for d in doc_result["documents"]
                   if len(d.get("text_preview", "").split(".")) >= 3]
@@ -952,16 +919,12 @@ def run(df, output_dir=None, run_absa=False, tier="full", run_embeddings=True,
     else:
         print("  No docs long enough for shift detection")
 
-    # S19: Sentiment timeline
-    timeline = generate_sentiment_timeline(df, output_dir=str(output))
-    if timeline:
-        doc_result["sentiment_timeline"] = timeline
 
+def _save_sentiment_outputs(doc_result, output):
     out_file = output / "sentiscape_ultra_results.json"
     out_file.write_text(json.dumps(doc_result, indent=2, default=str), encoding="utf-8")
     print(f"\nSaved: {out_file}")
 
-    # Fix 3: CSV per-document output
     csv_rows = []
     for doc in doc_result["documents"]:
         emo = doc.get("emoji_sentiment", {})
@@ -981,7 +944,8 @@ def run(df, output_dir=None, run_absa=False, tier="full", run_embeddings=True,
     csv_df.to_csv(csv_path, index=False)
     print(f"Saved: {csv_path}")
 
-    # Fix 4: Report HTML
+
+def _generate_html_report(doc_result, output):
     s = doc_result["summary"]
     sorted_all = sorted(doc_result["documents"], key=lambda d: d["ensemble_polarity"], reverse=True)
     top10_pos = sorted_all[:10]
@@ -1071,6 +1035,36 @@ def run(df, output_dir=None, run_absa=False, tier="full", run_embeddings=True,
     report_path.write_text(html, encoding="utf-8")
     print(f"Saved: {report_path}")
 
+
+# ─── Main orchestrator ───────────────────────────────────────────────────────
+
+
+def run(df, output_dir=None, run_absa=False, tier="full", run_embeddings=True,
+        max_docs=500, quiet=False, group_col_override=None):
+    output = Path(output_dir or "output")
+    output.mkdir(exist_ok=True)
+    _run_start = time.time()
+
+    _print_banner(tier, run_absa, run_embeddings)
+    ensemble = SentimentEnsemble(tier=tier)
+
+    group_col = group_col_override or next((c for c in df.columns if c.startswith("meta_")), None)
+    doc_result = _run_document_analysis(ensemble, df, max_docs, quiet, group_col, run_absa, run_embeddings)
+
+    if group_col and group_col in df.columns:
+        doc_result["group_comparison"] = _compute_group_comparison(group_col, doc_result, output)
+
+    doc_result["explanations"] = _generate_explanations(doc_result)
+    _detect_sentiment_shifts(doc_result)
+
+    timeline = generate_sentiment_timeline(df, text_col="text" if "text" in df.columns else "clean_text",
+                                           output_dir=str(output))
+    if timeline:
+        doc_result["sentiment_timeline"] = timeline
+
+    _save_sentiment_outputs(doc_result, output)
+    _generate_html_report(doc_result, output)
+
     # ── Schema JSONL + manifest ────────────────────────────────────────────
     if HAS_SCHEMA:
         std_docs = []
@@ -1146,7 +1140,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     tier = "lightweight" if args.profile == "fast" else "full"
-    df = load_documents(args.csv_path, args.text_col)
+    df = _load_documents(args.csv_path, args.text_col)
 
     if args.sample and args.sample < len(df):
         df = df.sample(n=args.sample, random_state=args.seed).reset_index(drop=True)
