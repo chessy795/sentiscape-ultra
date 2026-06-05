@@ -1041,54 +1041,94 @@ def _generate_html_report(doc_result, output):
     report_path.write_text(html, encoding="utf-8")
     print(f"Saved: {report_path}")
 
-    # ── ReportBuilder: lean HTML report with grounded interpretation ──
+    # ── ReportBuilder: comprehensive sentiment analysis report ──
     if HAS_REPORT:
         try:
-            n = len(doc_result.get("documents", []))
+            import plotly.express as px
+            docs = doc_result.get("documents", [])
             summary = doc_result.get("summary", {})
+            n = len(docs)
             rb = ReportBuilder(
                 "Sentiment Analysis ULTRA",
-                dataset=str(output),
+                dataset=doc_result.get("_input_file", ""),
                 n_docs=n,
                 extra_header=f"Profile: {doc_result.get('tier', 'full')}",
             )
 
-            # Key findings
+            # --- KEY FINDINGS (5+) ---
             findings = []
             dist = summary.get("label_distribution", {})
             total = sum(dist.values()) or 1
-            pos_pct = dist.get("positive", 0) / total * 100
-            neg_pct = dist.get("negative", 0) / total * 100
+            for label in ["positive", "negative", "neutral"]:
+                pct = dist.get(label, 0) / total * 100
+                findings.append(f"{pct:.0f}% {label} ({dist.get(label, 0)} docs)")
             mean_pol = summary.get("mean_polarity", 0)
-            findings.append(f"{pos_pct:.0f}% positive, {neg_pct:.0f}% negative, mean polarity={mean_pol:.3f}")
-
+            findings.append(f"Mean polarity: {mean_pol:+.3f} (range: -1 to +1)")
             gc = doc_result.get("group_comparison", {})
             if gc and gc.get("significant"):
-                findings.append(f"Significant group difference: Cohen's d={gc.get('cohens_d', 0):.2f} ({gc.get('effect_size', 'unknown')})")
+                findings.append(f"Significant group difference: d={gc.get('cohens_d',0):.2f} ({gc.get('effect_size','')})")
+            if docs:
+                most_pos = max(docs, key=lambda d: d.get("ensemble_polarity", 0))
+                most_neg = min(docs, key=lambda d: d.get("ensemble_polarity", 0))
+                findings.append(f"Most positive: '{str(most_pos.get('text_preview',''))[:80]}...' ({most_pos.get('ensemble_polarity',0):+.3f})")
+                findings.append(f"Most negative: '{str(most_neg.get('text_preview',''))[:80]}...' ({most_neg.get('ensemble_polarity',0):+.3f})")
+            rb.add_key_findings(findings[:7])
 
-            findings.append(f"Processed {n} documents with {doc_result.get('models_used', 'full')} profile")
-            rb.add_key_findings(findings[:5])
+            # --- RATIONALE ---
+            rb.add_rationale("Analysis Pipeline",
+                f"Profile: {doc_result.get('tier','full')}. Ensemble: RoBERTa x 0.7 + calibrated lexicons x 0.3. "
+                f"Lexicons: VADER, AFINN, NRC VAD, SentiWordNet.")
 
-            # Rationale
-            rb.add_rationale("Analysis Pipeline", f"Profile: {doc_result.get('tier', 'full')}. Ensemble: RoBERTa × 0.7 + calibrated lexicons × 0.3. Lexicons: VADER, AFINN, NRC VAD, SentiWordNet.")
-
-            # Metrics
+            # --- METRICS ---
             rb.add_metric("Mean Polarity", mean_pol, thresholds=THRESHOLDS.get("polarity"))
             if gc and gc.get("cohens_d") is not None:
-                rb.add_metric("Cohen's d", abs(gc.get("cohens_d", 0)), thresholds=THRESHOLDS.get("cohens_d"))
+                rb.add_metric("Cohen's d (groups)", abs(gc.get("cohens_d", 0)), thresholds=THRESHOLDS.get("cohens_d"))
 
-            # Table: sentiment by document
-            if "sentiment_by_doc" in doc_result:
-                senti_df = doc_result["sentiment_by_doc"]
-            else:
-                senti_df = pd.DataFrame([
-                    {"doc_id": d["doc_id"], "text_preview": d.get("text_preview", "")[:100]}
-                    for d in doc_result.get("documents", [])[:30]
-                ])
-            rb.add_table(senti_df.head(30), title="Sentiment by Document")
+            # --- CHARTS ---
+            if dist:
+                fig_dist = px.bar(
+                    x=list(dist.keys()), y=list(dist.values()),
+                    labels={"x": "Sentiment", "y": "Count"},
+                    title="Sentiment Distribution",
+                    color=list(dist.keys()),
+                    color_discrete_map={"positive": "#10b981", "negative": "#ef4444", "neutral": "#94a3b8"}
+                )
+                fig_dist.update_layout(showlegend=False)
+                rb.add_chart(fig_dist, title="Sentiment Distribution")
 
-            # Build
+            if docs:
+                polarities = [d.get("ensemble_polarity", 0) for d in docs]
+                fig_hist = px.histogram(
+                    x=polarities, nbins=30,
+                    labels={"x": "Polarity", "y": "Count"},
+                    title="Polarity Distribution",
+                    color_discrete_sequence=["#3b82f6"]
+                )
+                fig_hist.add_vline(x=0, line_dash="dash", line_color="gray")
+                fig_hist.update_layout(bargap=0.05)
+                rb.add_chart(fig_hist, title="Polarity Histogram")
+
+            # --- TABLES ---
+            if docs:
+                rows = []
+                for d in docs:
+                    emo = d.get("nrc_emotions", {})
+                    top_emo = max(emo, key=emo.get) if emo else ""
+                    rows.append({
+                        "doc_id": str(d.get("doc_id", ""))[:16],
+                        "text_preview": str(d.get("text_preview", ""))[:120],
+                        "label": d.get("ensemble_label", ""),
+                        "polarity": round(d.get("ensemble_polarity", 0), 4),
+                        "confidence": round(d.get("transformer", {}).get("results", {}).get("sentiment", {}).get("confidence", 0), 4),
+                        "vader": round(d.get("lexicon_raw", {}).get("vader", 0), 4),
+                        "top_emotion": top_emo,
+                    })
+                senti_df = pd.DataFrame(rows)
+                rb.add_table(senti_df, title="Sentiment by Document", expand_col="text_preview")
+
+            # --- BUILD ---
             rb.build(output / "report.html")
+            rb.build_csv(output / "raw_output.csv")
         except Exception as e:
             print(f"  [!] ReportBuilder error: {e}")
 
