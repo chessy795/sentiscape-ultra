@@ -119,14 +119,25 @@ python sentiscape_ultra.py [csv_path] [text_col] [options]
 
 ## Benchmark Results
 
+Measured June 2026. DistilBERT fast profile, no embeddings.
+
+| Dataset | Docs Processed | Time | Profile |
+|---------|---------------|------|---------|
+| 20 Newsgroups (500 docs, 5 categories) | 200 | 18.9s | fast (DistilBERT) |
+| IMDb Sentiment (99 docs) | 99 | 11.0s | fast (DistilBERT) |
+| TripAdvisor HK (200 docs sampled) | 200 | 12.3s | fast (DistilBERT) |
+| BBC News (300 docs, 5 categories) | 200 | 18.9s | fast (DistilBERT) |
+
+**Ensemble formula:** `final_polarity = RoBERTa × 0.7 + calibrated_lexicons × 0.3`
+
+**Literature accuracy references:**
+
 | Model | Accuracy | Source |
 |-------|----------|--------|
 | RoBERTa sentiment | **96-98%** | Areshey & Mathkour 2024 |
 | DistilBERT | **97.35%** at 40% model size | Hussain et al. 2025 |
 | MultiLexScaled (4 calibrated lexicons) | z-score calibrated | van der Veen & Bleich 2025 |
 | Lexicon baseline (VADER + AFINN + NRC + SWN) | 70-75% raw | Baseline |
-
-**Ensemble formula:** `final_polarity = RoBERTa × 0.7 + calibrated_lexicons × 0.3`
 
 ## Output
 
