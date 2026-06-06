@@ -1063,7 +1063,10 @@ def _generate_html_report(doc_result, output):
                 pct = dist.get(label, 0) / total * 100
                 findings.append(f"{pct:.0f}% {label} ({dist.get(label, 0)} docs)")
             mean_pol = summary.get("mean_polarity", 0)
-            findings.append(f"Mean polarity: {mean_pol:+.3f} (range: -1 to +1)")
+            std_pol = summary.get("std_polarity", 0)
+            findings.append(f"Mean polarity: {mean_pol:+.3f} (std={std_pol:.3f}, range: -1 to +1)")
+            median_pol = summary.get("median_polarity", 0)
+            findings.append(f"Median polarity: {median_pol:+.3f}")
             gc = doc_result.get("group_comparison", {})
             if gc and gc.get("significant"):
                 findings.append(f"Significant group difference: d={gc.get('cohens_d',0):.2f} ({gc.get('effect_size','')})")
@@ -1075,12 +1078,17 @@ def _generate_html_report(doc_result, output):
             rb.add_key_findings(findings[:7])
 
             # --- RATIONALE ---
+            cal = summary.get("calibration_stats", {})
+            cal_summary = ", ".join(f"{k}: mean={v.get('mean',0):.3f}" for k, v in cal.items()) if cal else "N/A"
             rb.add_rationale("Analysis Pipeline",
                 f"Profile: {doc_result.get('tier','full')}. Ensemble: RoBERTa x 0.7 + calibrated lexicons x 0.3. "
                 f"Lexicons: VADER, AFINN, NRC VAD, SentiWordNet.")
+            rb.add_rationale("Calibration",
+                f"MultiLexScaled z-score calibration. Calibrated lexicon mean: {summary.get('calibration_stats',{}).get('calibrated',{}).get('mean',0):.3f}")
 
             # --- METRICS ---
             rb.add_metric("Mean Polarity", mean_pol, thresholds=THRESHOLDS.get("polarity"))
+            rb.add_metric("Std Polarity", std_pol)
             if gc and gc.get("cohens_d") is not None:
                 rb.add_metric("Cohen's d (groups)", abs(gc.get("cohens_d", 0)), thresholds=THRESHOLDS.get("cohens_d"))
 
@@ -1108,23 +1116,74 @@ def _generate_html_report(doc_result, output):
                 fig_hist.update_layout(bargap=0.05)
                 rb.add_chart(fig_hist, title="Polarity Histogram")
 
+            # Emotion breakdown chart (average NRC emotions)
+            if docs:
+                emo_sums = {}
+                n_emo = 0
+                for d in docs:
+                    emo = d.get("nrc_emotions", {})
+                    if emo:
+                        n_emo += 1
+                        for k, v in emo.items():
+                            emo_sums[k] = emo_sums.get(k, 0) + v
+                if emo_sums and n_emo > 0:
+                    emo_avg = {k: v / n_emo for k, v in sorted(emo_sums.items(), key=lambda x: -x[1])}
+                    fig_emo = px.bar(
+                        x=list(emo_avg.keys()), y=list(emo_avg.values()),
+                        labels={"x": "Emotion", "y": "Average Score"},
+                        title=f"NRC Emotion Breakdown (n={n_emo} docs with emotions)",
+                        color=list(emo_avg.keys()),
+                        color_discrete_sequence=px.colors.qualitative.Set2
+                    )
+                    fig_emo.update_layout(showlegend=False)
+                    rb.add_chart(fig_emo, title="NRC Emotion Breakdown")
+
+            # Lexicon comparison chart
+            if docs:
+                lex_means = {}
+                for lex_name in ["vader", "afinn", "nrc_vad", "swn"]:
+                    vals = [d.get("lexicon_raw", {}).get(lex_name, 0) for d in docs if d.get("lexicon_raw", {}).get(lex_name) is not None]
+                    if vals:
+                        lex_means[lex_name.upper()] = sum(vals) / len(vals)
+                if lex_means:
+                    fig_lex = px.bar(
+                        x=list(lex_means.keys()), y=list(lex_means.values()),
+                        labels={"x": "Lexicon", "y": "Mean Score"},
+                        title="Lexicon Comparison (Raw Means)",
+                        color=list(lex_means.keys()),
+                        color_discrete_sequence=["#6366f1", "#f59e0b", "#10b981", "#ef4444"]
+                    )
+                    fig_lex.update_layout(showlegend=False)
+                    rb.add_chart(fig_lex, title="Lexicon Comparison")
+
             # --- TABLES ---
             if docs:
                 rows = []
                 for d in docs:
                     emo = d.get("nrc_emotions", {})
                     top_emo = max(emo, key=emo.get) if emo else ""
+                    lex = d.get("lexicon_raw", {})
                     rows.append({
                         "doc_id": str(d.get("doc_id", ""))[:16],
                         "text_preview": str(d.get("text_preview", ""))[:120],
                         "label": d.get("ensemble_label", ""),
                         "polarity": round(d.get("ensemble_polarity", 0), 4),
-                        "confidence": round(d.get("transformer", {}).get("results", {}).get("sentiment", {}).get("confidence", 0), 4),
-                        "vader": round(d.get("lexicon_raw", {}).get("vader", 0), 4),
+                        "confidence": round(d.get("transformer", {}).get("results", {}).get("sentiment", {}).get("confidence", 0) or d.get("transformer", {}).get("results", {}).get("lightweight", {}).get("confidence", 0), 4),
+                        "vader": round(lex.get("vader", 0), 4),
+                        "afinn": round(lex.get("afinn", 0), 4),
+                        "nrc_vad": round(lex.get("nrc_vad", 0), 4),
+                        "swn": round(lex.get("swn", 0), 4),
                         "top_emotion": top_emo,
                     })
                 senti_df = pd.DataFrame(rows)
                 rb.add_table(senti_df, title="Sentiment by Document", expand_col="text_preview")
+
+            # Calibration stats table
+            cal = summary.get("calibration_stats", {})
+            if cal:
+                cal_rows = [{"lexicon": k, "mean": round(v.get("mean", 0), 4), "std": round(v.get("std", 0), 4)} for k, v in cal.items()]
+                cal_df = pd.DataFrame(cal_rows)
+                rb.add_table(cal_df, title="Lexicon Calibration Statistics")
 
             # --- BUILD ---
             rb.build(output / "report.html")
